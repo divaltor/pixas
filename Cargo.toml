@@ -5,8 +5,9 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.0", features = ["derive"] }
-photon-rs = "0.3.2"
 image = "0.24"
+imageproc = "0.24"
+terminal_size = "0.3"
 
 [profile.release]
 lto = true
