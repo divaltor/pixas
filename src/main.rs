@@ -1,6 +1,18 @@
 use clap::Parser;
-use image::{ImageBuffer, Rgb, RgbImage, DynamicImage};
+use image::{DynamicImage, ImageBuffer, Rgb, RgbImage};
 use std::path::PathBuf;
+
+#[derive(Clone, Copy)]
+struct EdgeInfo {
+    magnitude: f32,
+    direction: f32, // in radians
+}
+
+#[derive(Clone)]
+struct CharInfo {
+    character: char,
+    density: usize, // Number of set pixels in bitmap
+}
 
 #[derive(Parser)]
 #[command(name = "pixas")]
@@ -12,32 +24,35 @@ pub struct Args {
     #[arg(short, long, default_value = "output.png")]
     pub output: PathBuf,
 
-    #[arg(long, default_value = " ░▒▓█")]
-    pub charset: String,
-
     #[arg(long, default_value = "8")]
     pub cell_size: u32,
-
-    #[arg(long, default_value = "16")]
-    pub font_size: u32,
 
     #[arg(long)]
     pub no_dither: bool,
 
-    #[arg(long, default_value = "0.7")]
-    pub stroke_density: f32,
-
-    #[arg(long, default_value = "0,45,90")]
-    pub hatch_angles: String,
-
-    #[arg(long, default_value = "2.0")]
+    #[arg(long, default_value = "1.0")]
     pub upscale_factor: f32,
-    
+
     #[arg(long)]
     pub terminal: bool,
-    
-    #[arg(long, default_value = "block")]
+
+    #[arg(long, default_value = "ascii")]
     pub charset_type: String,
+
+    #[arg(long, default_value = "0.1")]
+    pub edge_threshold: f32,
+
+    #[arg(long)]
+    pub color: bool,
+
+    #[arg(long, default_value = "0.5")]
+    pub color_intensity: f32,
+
+    #[arg(long, default_value = "#ffffff")]
+    pub fg_color: String,
+
+    #[arg(long, default_value = "#15091b")]
+    pub bg_color: String,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -51,12 +66,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         img
     };
 
-    let processed_img = process_image(upscaled_img, &args)?;
+    let (processed_img, edge_info, color_img) = process_image(upscaled_img, &args)?;
 
     if args.terminal {
-        render_to_terminal(&processed_img, &args)?;
+        render_to_terminal(&processed_img, &edge_info, &color_img, &args)?;
     } else {
-        render_to_ascii(&processed_img, &args)?;
+        render_to_ascii(&processed_img, &edge_info, &color_img, &args)?;
     }
 
     Ok(())
@@ -66,15 +81,21 @@ fn upscale_image(img: RgbImage, scale_factor: f32) -> Result<RgbImage, Box<dyn s
     let (width, height) = img.dimensions();
     let new_width = (width as f32 * scale_factor) as u32;
     let new_height = (height as f32 * scale_factor) as u32;
-    
+
     // Convert to DynamicImage for resizing with high-quality filter
     let dynamic_img = DynamicImage::ImageRgb8(img);
     let resized = dynamic_img.resize(new_width, new_height, image::imageops::FilterType::Lanczos3);
-    
+
     Ok(resized.to_rgb8())
 }
 
-fn process_image(img: RgbImage, args: &Args) -> Result<RgbImage, Box<dyn std::error::Error>> {
+fn process_image(
+    img: RgbImage,
+    args: &Args,
+) -> Result<(RgbImage, Vec<Vec<EdgeInfo>>, Option<RgbImage>), Box<dyn std::error::Error>> {
+    // Keep original color image if color mode is enabled
+    let color_img = if args.color { Some(img.clone()) } else { None };
+
     let mut processed = apply_grayscale_and_tone_mapping(img);
 
     if !args.no_dither {
@@ -82,14 +103,24 @@ fn process_image(img: RgbImage, args: &Args) -> Result<RgbImage, Box<dyn std::er
         processed = apply_difference_of_gaussians(processed, args)?;
     }
 
+    // Compute edge information
+    let edge_info = compute_edge_information(&processed);
+
     processed = apply_edge_tangent_flow(processed, args)?;
 
-    Ok(processed)
+    Ok((processed, edge_info, color_img))
 }
 
 const DEFAULT_BLOCK: &str = " .:coPO?@█";
 const DEFAULT_ASCII: &str = " .:-=+*%@#";
-const FULL_CHARACTERS: &str = " .-:=+iltIcsv1x%7aejorzfnuCJT3*69LYpqy25SbdgFGOVXkPhmw48AQDEHKUZR@B#NW0M";
+const FULL_CHARACTERS: &str =
+    " .-:=+iltIcsv1x%7aejorzfnuCJT3*69LYpqy25SbdgFGOVXkPhmw48AQDEHKUZR@B#NW0M";
+
+// Edge direction characters
+const EDGE_HORIZONTAL: char = '-';
+const EDGE_VERTICAL: char = '|';
+const EDGE_DIAGONAL_1: char = '\\';
+const EDGE_DIAGONAL_2: char = '/';
 
 fn get_charset_by_type(charset_type: &str) -> &str {
     match charset_type {
@@ -100,72 +131,162 @@ fn get_charset_by_type(charset_type: &str) -> &str {
     }
 }
 
+fn calculate_bitmap_density(character: char) -> usize {
+    let pattern = get_char_pattern(character);
+    pattern.iter().map(|&row| row.count_ones() as usize).sum()
+}
+
+fn create_sorted_charset(charset: &str) -> Vec<CharInfo> {
+    let mut char_infos: Vec<CharInfo> = charset
+        .chars()
+        .map(|c| CharInfo {
+            character: c,
+            density: calculate_bitmap_density(c),
+        })
+        .collect();
+
+    // Sort by density (ascending - lighter to darker)
+    char_infos.sort_by(|a, b| a.density.cmp(&b.density));
+    char_infos
+}
+
+fn parse_hex_color(hex: &str) -> Result<(u8, u8, u8), Box<dyn std::error::Error>> {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() != 6 {
+        return Err("Invalid hex color format".into());
+    }
+
+    let r = u8::from_str_radix(&hex[0..2], 16)?;
+    let g = u8::from_str_radix(&hex[2..4], 16)?;
+    let b = u8::from_str_radix(&hex[4..6], 16)?;
+
+    Ok((r, g, b))
+}
+
+fn select_character_with_flow(
+    brightness: f32,
+    edge_info: &EdgeInfo,
+    char_infos: &[CharInfo],
+    edge_threshold: f32,
+) -> char {
+    if edge_info.magnitude > edge_threshold {
+        // For strong edges, use directional characters
+        get_edge_character(edge_info.direction)
+    } else {
+        // For regular areas, use density-based selection with flow influence
+        let base_index =
+            ((1.0 - brightness / 255.0) * (char_infos.len() - 1) as f32).round() as usize;
+        let base_index = base_index.min(char_infos.len() - 1);
+
+        // Apply flow-based perturbation for more organic selection
+        let flow_influence = (edge_info.magnitude * 2.0).min(1.0); // Normalize to 0-1
+        let perturbation = (flow_influence * 2.0 - 1.0) * 2.0; // -2 to +2 range
+
+        let adjusted_index = (base_index as f32 + perturbation).round() as i32;
+        let final_index = adjusted_index.clamp(0, char_infos.len() as i32 - 1) as usize;
+
+        char_infos[final_index].character
+    }
+}
+
 fn get_terminal_size() -> (u32, u32) {
-    if let Some((terminal_size::Width(w), terminal_size::Height(h))) = terminal_size::terminal_size() {
+    if let Some((terminal_size::Width(w), terminal_size::Height(h))) =
+        terminal_size::terminal_size()
+    {
         (w as u32, h as u32)
     } else {
         (80, 24) // Default fallback
     }
 }
 
-fn render_to_terminal(img: &RgbImage, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+fn render_to_terminal(
+    img: &RgbImage,
+    edge_info: &Vec<Vec<EdgeInfo>>,
+    color_img: &Option<RgbImage>,
+    args: &Args,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (term_width, term_height) = get_terminal_size();
     let (img_width, img_height) = img.dimensions();
-    
+
     // Stretch ASCII to fill terminal dimensions (with small margin)
     let ascii_width = term_width.saturating_sub(2); // Leave 1 char margin on each side
     let ascii_height = term_height.saturating_sub(3); // Leave margin for spacing
-    
-    let charset = if args.charset != " ░▒▓█" {
-        args.charset.as_str()
-    } else {
-        get_charset_by_type(&args.charset_type)
-    };
-    
-    let charset_chars: Vec<char> = charset.chars().collect();
-    let charset_len = charset_chars.len();
-    
+
+    let charset = get_charset_by_type(&args.charset_type);
+    let char_infos = create_sorted_charset(charset);
+
     // Calculate sampling step sizes
     let step_x = img_width as f32 / ascii_width as f32;
     let step_y = img_height as f32 / ascii_height as f32;
-    
+
     // Set terminal to black background with white text
     print!("\x1b[40m\x1b[37m\x1b[2J\x1b[H"); // Black bg, white text, clear screen, move to home
-    
+
     for y in 0..ascii_height {
         for x in 0..ascii_width {
             // Sample multiple pixels for better quality
             let sample_x = (x as f32 * step_x) as u32;
             let sample_y = (y as f32 * step_y) as u32;
-            
+
             let mut total_brightness = 0.0;
             let mut pixel_count = 0;
-            
+
             // Sample a small area around the point for better quality
             let sample_size = 1.max((step_x.min(step_y) / 2.0) as u32).min(3); // Limit sample size
-            
+
             for dy in 0..sample_size {
                 for dx in 0..sample_size {
                     let px = (sample_x + dx).min(img_width - 1);
                     let py = (sample_y + dy).min(img_height - 1);
-                    
+
                     let pixel = img.get_pixel(px, py);
                     total_brightness += pixel[0] as f32;
                     pixel_count += 1;
                 }
             }
-            
+
             let avg_brightness = total_brightness / pixel_count as f32;
-            
-            // Map brightness to character (normal mapping for white text on black background)
-            let char_index = ((avg_brightness / 255.0) * (charset_len - 1) as f32).round() as usize;
-            let ascii_char = charset_chars[char_index.min(charset_len - 1)];
-            
-            print!("{}", ascii_char);
+
+            // Use flow-based character selection for terminal
+            let ascii_char =
+                if sample_y < edge_info.len() as u32 && sample_x < edge_info[0].len() as u32 {
+                    let edge = edge_info[sample_y as usize][sample_x as usize];
+                    // For terminal, we use normal brightness mapping (not inverted)
+                    select_character_with_flow(
+                        255.0 - avg_brightness,
+                        &edge,
+                        &char_infos,
+                        args.edge_threshold,
+                    )
+                } else {
+                    // Fallback to simple brightness mapping (normal mapping for white text on black background)
+                    let char_index =
+                        ((avg_brightness / 255.0) * (char_infos.len() - 1) as f32).round() as usize;
+                    char_infos[char_index.min(char_infos.len() - 1)].character
+                };
+
+            if args.color && color_img.is_some() {
+                let color_img = color_img.as_ref().unwrap();
+                let (r, g, b) = get_average_color(color_img, sample_x, sample_y, sample_size);
+
+                // Apply color intensity
+                let intensity = args.color_intensity;
+                let adjusted_r = ((r as f32) * intensity + (255.0 * (1.0 - intensity))) as u8;
+                let adjusted_g = ((g as f32) * intensity + (255.0 * (1.0 - intensity))) as u8;
+                let adjusted_b = ((b as f32) * intensity + (255.0 * (1.0 - intensity))) as u8;
+
+                print!(
+                    "{}{}",
+                    rgb_to_ansi_color(adjusted_r, adjusted_g, adjusted_b),
+                    ascii_char
+                );
+            } else {
+                print!("{}", ascii_char);
+            }
         }
         println!(); // New line after each row
     }
-    
+
     // Reset terminal colors
     print!("\x1b[0m");
     println!(); // Add some spacing at the end
@@ -174,27 +295,161 @@ fn render_to_terminal(img: &RgbImage, args: &Args) -> Result<(), Box<dyn std::er
 
 fn apply_grayscale_and_tone_mapping(img: RgbImage) -> RgbImage {
     let (width, height) = img.dimensions();
-    let mut output = RgbImage::new(width, height);
+    let mut grayscale = RgbImage::new(width, height);
 
+    // Convert to grayscale first
     for (x, y, pixel) in img.enumerate_pixels() {
         let r = pixel[0] as f32;
         let g = pixel[1] as f32;
         let b = pixel[2] as f32;
 
         let luminance = (0.299 * r + 0.587 * g + 0.114 * b) as u8;
-        output.put_pixel(x, y, Rgb([luminance, luminance, luminance]));
+        grayscale.put_pixel(x, y, Rgb([luminance, luminance, luminance]));
+    }
+
+    // Apply histogram-based auto-contrast adjustment
+    apply_auto_contrast(grayscale)
+}
+
+fn apply_auto_contrast(img: RgbImage) -> RgbImage {
+    let (width, height) = img.dimensions();
+    let mut histogram = [0u32; 256];
+
+    // Build histogram
+    for pixel in img.pixels() {
+        histogram[pixel[0] as usize] += 1;
+    }
+
+    let total_pixels = (width * height) as f32;
+    let clip_percent = 0.01; // 1% clipping on each side
+    let clip_threshold = (total_pixels * clip_percent) as u32;
+
+    // Find clipping points
+    let mut low_clip = 0u8;
+    let mut high_clip = 255u8;
+
+    // Find lower clipping point
+    let mut cumulative = 0u32;
+    for (i, &count) in histogram.iter().enumerate() {
+        cumulative += count;
+        if cumulative >= clip_threshold {
+            low_clip = i as u8;
+            break;
+        }
+    }
+
+    // Find upper clipping point
+    cumulative = 0;
+    for (i, &count) in histogram.iter().enumerate().rev() {
+        cumulative += count;
+        if cumulative >= clip_threshold {
+            high_clip = i as u8;
+            break;
+        }
+    }
+
+    // Avoid division by zero
+    if high_clip <= low_clip {
+        return img;
+    }
+
+    let range = high_clip as f32 - low_clip as f32;
+    let alpha = 255.0 / range;
+    let beta = -(low_clip as f32) * alpha;
+
+    let mut output = RgbImage::new(width, height);
+
+    // Apply linear transformation: new_pixel = pixel * alpha + beta
+    for (x, y, pixel) in img.enumerate_pixels() {
+        let old_value = pixel[0] as f32;
+        let new_value = (old_value * alpha + beta).clamp(0.0, 255.0) as u8;
+        output.put_pixel(x, y, Rgb([new_value, new_value, new_value]));
     }
 
     output
 }
 
+fn compute_edge_information(img: &RgbImage) -> Vec<Vec<EdgeInfo>> {
+    let (width, height) = img.dimensions();
+    let mut edge_info = vec![
+        vec![
+            EdgeInfo {
+                magnitude: 0.0,
+                direction: 0.0
+            };
+            width as usize
+        ];
+        height as usize
+    ];
+
+    for y in 1..height - 1 {
+        for x in 1..width - 1 {
+            let gx = sobel_x(img, x, y);
+            let gy = sobel_y(img, x, y);
+
+            let magnitude = (gx * gx + gy * gy).sqrt();
+            let direction = gy.atan2(gx); // Returns angle in radians
+
+            edge_info[y as usize][x as usize] = EdgeInfo {
+                magnitude,
+                direction,
+            };
+        }
+    }
+
+    edge_info
+}
+
+fn get_edge_character(direction: f32) -> char {
+    // Convert direction to degrees and normalize to 0-180 range
+    let degrees = direction.to_degrees().rem_euclid(180.0);
+
+    match degrees {
+        d if d < 22.5 || d >= 157.5 => EDGE_HORIZONTAL, // Horizontal: -
+        d if d >= 22.5 && d < 67.5 => EDGE_DIAGONAL_2,  // Diagonal /
+        d if d >= 67.5 && d < 112.5 => EDGE_VERTICAL,   // Vertical: |
+        _ => EDGE_DIAGONAL_1,                           // Diagonal \
+    }
+}
+
+fn rgb_to_ansi_color(r: u8, g: u8, b: u8) -> String {
+    format!("\x1b[38;2;{};{};{}m", r, g, b)
+}
+
+fn get_average_color(img: &RgbImage, x: u32, y: u32, sample_size: u32) -> (u8, u8, u8) {
+    let (width, height) = img.dimensions();
+    let mut total_r = 0.0;
+    let mut total_g = 0.0;
+    let mut total_b = 0.0;
+    let mut pixel_count = 0;
+
+    for dy in 0..sample_size {
+        for dx in 0..sample_size {
+            let px = (x + dx).min(width - 1);
+            let py = (y + dy).min(height - 1);
+
+            let pixel = img.get_pixel(px, py);
+            total_r += pixel[0] as f32;
+            total_g += pixel[1] as f32;
+            total_b += pixel[2] as f32;
+            pixel_count += 1;
+        }
+    }
+
+    (
+        (total_r / pixel_count as f32) as u8,
+        (total_g / pixel_count as f32) as u8,
+        (total_b / pixel_count as f32) as u8,
+    )
+}
+
 fn apply_floyd_steinberg_dithering(img: RgbImage) -> RgbImage {
     let (width, height) = img.dimensions();
     let mut output = img.clone();
-    
+
     // Convert to working with raw pixel data for efficient manipulation
     let mut pixels: Vec<Vec<f32>> = Vec::with_capacity(height as usize);
-    
+
     // Convert RGB to grayscale values for dithering
     for y in 0..height {
         let mut row: Vec<f32> = Vec::with_capacity(width as usize);
@@ -206,36 +461,36 @@ fn apply_floyd_steinberg_dithering(img: RgbImage) -> RgbImage {
         }
         pixels.push(row);
     }
-    
+
     // Apply Floyd-Steinberg dithering
     for y in 0..height {
         for x in 0..width {
             let old_pixel = pixels[y as usize][x as usize];
             let new_pixel = if old_pixel > 127.5 { 255.0 } else { 0.0 };
             let error = old_pixel - new_pixel;
-            
+
             // Set the quantized pixel
             pixels[y as usize][x as usize] = new_pixel;
-            
+
             // Distribute error to neighboring pixels using Floyd-Steinberg pattern
             // Pattern:    X   7/16
             //           3/16  5/16  1/16
-            
+
             // Right pixel (7/16)
             if x + 1 < width {
                 pixels[y as usize][(x + 1) as usize] += error * 7.0 / 16.0;
             }
-            
+
             // Bottom row pixels
             if y + 1 < height {
                 // Bottom-left pixel (3/16)
                 if x > 0 {
                     pixels[(y + 1) as usize][(x - 1) as usize] += error * 3.0 / 16.0;
                 }
-                
+
                 // Bottom pixel (5/16)
                 pixels[(y + 1) as usize][x as usize] += error * 5.0 / 16.0;
-                
+
                 // Bottom-right pixel (1/16)
                 if x + 1 < width {
                     pixels[(y + 1) as usize][(x + 1) as usize] += error * 1.0 / 16.0;
@@ -243,7 +498,7 @@ fn apply_floyd_steinberg_dithering(img: RgbImage) -> RgbImage {
             }
         }
     }
-    
+
     // Convert back to RGB image
     for y in 0..height {
         for x in 0..width {
@@ -251,7 +506,7 @@ fn apply_floyd_steinberg_dithering(img: RgbImage) -> RgbImage {
             output.put_pixel(x, y, Rgb([value, value, value]));
         }
     }
-    
+
     output
 }
 
@@ -418,39 +673,58 @@ fn sobel_y(img: &RgbImage, x: u32, y: u32) -> f32 {
     (-tl - 2.0 * tm - tr + bl + 2.0 * bm + br) / 4.0 / 255.0
 }
 
-fn render_to_ascii(img: &RgbImage, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+fn render_to_ascii(
+    img: &RgbImage,
+    edge_info: &Vec<Vec<EdgeInfo>>,
+    color_img: &Option<RgbImage>,
+    args: &Args,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (width, height) = img.dimensions();
-    let charset: Vec<char> = args.charset.chars().collect();
-    let charset_len = charset.len();
+    let charset = get_charset_by_type(&args.charset_type);
+    let char_infos = create_sorted_charset(charset);
 
-    // Calculate ASCII grid dimensions
-    let ascii_cols = (width / (args.cell_size / 2)) as u32;
-    let ascii_rows = (height / args.cell_size) as u32;
+    // Parse colors
+    let fg_color = parse_hex_color(&args.fg_color)?;
+    let bg_color = parse_hex_color(&args.bg_color)?;
 
-    // Calculate output image dimensions
-    let font_size = args.font_size;
-    let char_width = (font_size as f32 * 0.6) as u32;
-    let char_height = font_size;
+    // Calculate output dimensions based on block size
+    let output_width = (width / args.cell_size) * args.cell_size;
+    let output_height = (height / args.cell_size) * args.cell_size;
 
-    let output_width = ascii_cols * char_width;
-    let output_height = ascii_rows * char_height;
+    // Create output image buffer and fill with background color
+    let mut img_buffer: RgbImage = ImageBuffer::new(output_width, output_height);
+    for pixel in img_buffer.pixels_mut() {
+        *pixel = Rgb([bg_color.0, bg_color.1, bg_color.2]);
+    }
 
-    // Create ASCII character grid
-    let mut ascii_grid = Vec::new();
-
-    for y in (0..height).step_by(args.cell_size as usize) {
-        let mut row = Vec::new();
-
-        for x in (0..width).step_by(args.cell_size as usize / 2) {
+    // Process each block
+    for y in (0..output_height).step_by(args.cell_size as usize) {
+        for x in (0..output_width).step_by(args.cell_size as usize) {
+            // Calculate average brightness for this block
             let mut total_brightness = 0.0;
             let mut pixel_count = 0;
+            let mut total_r = 0.0;
+            let mut total_g = 0.0;
+            let mut total_b = 0.0;
 
-            // Sample brightness from the cell
-            for cy in y..std::cmp::min(y + args.cell_size, height) {
-                for cx in x..std::cmp::min(x + args.cell_size / 2, width) {
-                    let pixel = img.get_pixel(cx, cy);
-                    total_brightness += pixel[0] as f32;
-                    pixel_count += 1;
+            let block_end_x = std::cmp::min(x + args.cell_size, output_width);
+            let block_end_y = std::cmp::min(y + args.cell_size, output_height);
+
+            for by in y..block_end_y {
+                for bx in x..block_end_x {
+                    if bx < width && by < height {
+                        let pixel = img.get_pixel(bx, by);
+                        total_brightness += pixel[0] as f32;
+                        pixel_count += 1;
+
+                        // Also get color information if available
+                        if let Some(color_img_ref) = color_img {
+                            let color_pixel = color_img_ref.get_pixel(bx, by);
+                            total_r += color_pixel[0] as f32;
+                            total_g += color_pixel[1] as f32;
+                            total_b += color_pixel[2] as f32;
+                        }
+                    }
                 }
             }
 
@@ -460,38 +734,50 @@ fn render_to_ascii(img: &RgbImage, args: &Args) -> Result<(), Box<dyn std::error
                 0.0
             };
 
-            // Map brightness to character
-            let char_index =
-                ((1.0 - avg_brightness / 255.0) * (charset_len - 1) as f32).round() as usize;
-            let ascii_char = charset[char_index.min(charset_len - 1)];
+            // Select character based on brightness and edge info
+            let ascii_char = if (y / args.cell_size) < edge_info.len() as u32
+                && (x / args.cell_size) < edge_info[0].len() as u32
+            {
+                let edge_y = (y / args.cell_size) as usize;
+                let edge_x = (x / args.cell_size) as usize;
+                let edge = edge_info[edge_y][edge_x];
 
-            row.push((ascii_char, avg_brightness));
-        }
-        ascii_grid.push(row);
-    }
+                select_character_with_flow(avg_brightness, &edge, &char_infos, args.edge_threshold)
+            } else {
+                // Fallback to simple brightness mapping
+                let char_index = ((1.0 - avg_brightness / 255.0) * (char_infos.len() - 1) as f32)
+                    .round() as usize;
+                char_infos[char_index.min(char_infos.len() - 1)].character
+            };
 
-    // Create output image buffer
-    let mut img_buffer: RgbImage = ImageBuffer::new(output_width, output_height);
+            // Determine colors to use
+            let char_color = if args.color && color_img.is_some() && pixel_count > 0 {
+                let avg_r = (total_r / pixel_count as f32) as u8;
+                let avg_g = (total_g / pixel_count as f32) as u8;
+                let avg_b = (total_b / pixel_count as f32) as u8;
 
-    // Fill with white background
-    for pixel in img_buffer.pixels_mut() {
-        *pixel = Rgb([255, 255, 255]);
-    }
+                // Apply color intensity
+                let intensity = args.color_intensity;
+                let final_r =
+                    ((avg_r as f32) * intensity + (fg_color.0 as f32) * (1.0 - intensity)) as u8;
+                let final_g =
+                    ((avg_g as f32) * intensity + (fg_color.1 as f32) * (1.0 - intensity)) as u8;
+                let final_b =
+                    ((avg_b as f32) * intensity + (fg_color.2 as f32) * (1.0 - intensity)) as u8;
+                (final_r, final_g, final_b)
+            } else {
+                fg_color
+            };
 
-    // Render ASCII characters as bitmap patterns
-    for (row_idx, row) in ascii_grid.iter().enumerate() {
-        for (col_idx, &(ascii_char, brightness)) in row.iter().enumerate() {
-            let start_x = col_idx as u32 * char_width;
-            let start_y = row_idx as u32 * char_height;
-
-            render_char_bitmap(
+            // Render the character bitmap
+            render_ascii_char_to_image(
                 &mut img_buffer,
                 ascii_char,
-                start_x,
-                start_y,
-                char_width,
-                char_height,
-                brightness,
+                x,
+                y,
+                args.cell_size,
+                char_color,
+                bg_color,
             );
         }
     }
@@ -503,6 +789,50 @@ fn render_to_ascii(img: &RgbImage, args: &Args) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
+fn render_ascii_char_to_image(
+    img_buffer: &mut RgbImage,
+    character: char,
+    start_x: u32,
+    start_y: u32,
+    block_size: u32,
+    char_color: (u8, u8, u8),
+    bg_color: (u8, u8, u8),
+) {
+    let pattern = get_char_pattern(character);
+    let (img_width, img_height) = img_buffer.dimensions();
+
+    let block_w = std::cmp::min(block_size, img_width - start_x);
+    let block_h = std::cmp::min(block_size, img_height - start_y);
+
+    for dy in 0..block_h {
+        for dx in 0..block_w {
+            let img_x = start_x + dx;
+            let img_y = start_y + dy;
+
+            if img_x < img_width && img_y < img_height {
+                // Scale bitmap coordinates to 8x8 pattern
+                let pattern_x = (dx * 8) / block_size;
+                let pattern_y = (dy * 8) / block_size;
+
+                if pattern_y < 8 && pattern_x < 8 {
+                    let shift = 7 - pattern_x;
+                    let bit = 1u8 << shift;
+
+                    let pixel = img_buffer.get_pixel_mut(img_x, img_y);
+
+                    if (pattern[pattern_y as usize] & bit) != 0 {
+                        // Character pixel: use character color
+                        *pixel = Rgb([char_color.0, char_color.1, char_color.2]);
+                    } else {
+                        // Background pixel: use background color
+                        *pixel = Rgb([bg_color.0, bg_color.1, bg_color.2]);
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn render_char_bitmap(
     img_buffer: &mut RgbImage,
     character: char,
@@ -511,6 +841,7 @@ fn render_char_bitmap(
     char_width: u32,
     char_height: u32,
     brightness: f32,
+    color: Option<(u8, u8, u8)>,
 ) {
     // Simple bitmap patterns for common ASCII characters
     let pattern = get_char_pattern(character);
@@ -534,10 +865,99 @@ fn render_char_bitmap(
                         let final_y = img_y + dy;
 
                         if final_x < img_buffer.width() && final_y < img_buffer.height() {
-                            // Use brightness to determine darkness
-                            let color_value = (255.0 - brightness).clamp(0.0, 255.0) as u8;
                             let pixel = img_buffer.get_pixel_mut(final_x, final_y);
-                            *pixel = Rgb([color_value, color_value, color_value]);
+
+                            if let Some((r, g, b)) = color {
+                                // Use color with brightness adjustment
+                                let brightness_factor = (255.0 - brightness) / 255.0;
+                                let final_r =
+                                    (r as f32 * brightness_factor).clamp(0.0, 255.0) as u8;
+                                let final_g =
+                                    (g as f32 * brightness_factor).clamp(0.0, 255.0) as u8;
+                                let final_b =
+                                    (b as f32 * brightness_factor).clamp(0.0, 255.0) as u8;
+                                *pixel = Rgb([final_r, final_g, final_b]);
+                            } else {
+                                // Use brightness to determine darkness (grayscale)
+                                let color_value = (255.0 - brightness).clamp(0.0, 255.0) as u8;
+                                *pixel = Rgb([color_value, color_value, color_value]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn render_char_bitmap_with_flow(
+    img_buffer: &mut RgbImage,
+    character: char,
+    start_x: u32,
+    start_y: u32,
+    char_width: u32,
+    char_height: u32,
+    brightness: f32,
+    color: Option<(u8, u8, u8)>,
+    edge_info: &EdgeInfo,
+) {
+    let pattern = get_char_pattern(character);
+    let pattern_size = 8;
+
+    let scale_x = char_width as f32 / pattern_size as f32;
+    let scale_y = char_height as f32 / pattern_size as f32;
+
+    // Apply flow-based distortion
+    let flow_strength = (edge_info.magnitude * 3.0).min(2.0); // Limit distortion
+    let flow_dx = edge_info.direction.cos() * flow_strength;
+    let flow_dy = edge_info.direction.sin() * flow_strength;
+
+    for py in 0..pattern_size {
+        for px in 0..pattern_size {
+            let bit = (pattern[py] >> (7 - px)) & 1;
+            if bit == 1 {
+                // Apply flow distortion to pixel position
+                let base_x = px as f32 * scale_x;
+                let base_y = py as f32 * scale_y;
+
+                // Create organic distortion based on edge flow
+                let distortion_factor = (py as f32 / pattern_size as f32) * flow_strength;
+                let distorted_x = base_x + flow_dx * distortion_factor;
+                let distorted_y = base_y + flow_dy * distortion_factor;
+
+                let img_x = start_x + distorted_x as u32;
+                let img_y = start_y + distorted_y as u32;
+
+                // Draw with slight anti-aliasing effect for smoother flow
+                for dy in 0..(scale_y.ceil() as u32 + 1) {
+                    for dx in 0..(scale_x.ceil() as u32 + 1) {
+                        let final_x = img_x + dx;
+                        let final_y = img_y + dy;
+
+                        if final_x < img_buffer.width() && final_y < img_buffer.height() {
+                            let pixel = img_buffer.get_pixel_mut(final_x, final_y);
+
+                            // Calculate alpha based on distance from center for anti-aliasing
+                            let center_dist = ((dx as f32 - scale_x / 2.0).powi(2)
+                                + (dy as f32 - scale_y / 2.0).powi(2))
+                            .sqrt();
+                            let alpha = (1.0 - (center_dist / (scale_x.max(scale_y) * 0.7)))
+                                .clamp(0.3, 1.0);
+
+                            if let Some((r, g, b)) = color {
+                                let brightness_factor = ((255.0 - brightness) / 255.0) * alpha;
+                                let final_r =
+                                    (r as f32 * brightness_factor).clamp(0.0, 255.0) as u8;
+                                let final_g =
+                                    (g as f32 * brightness_factor).clamp(0.0, 255.0) as u8;
+                                let final_b =
+                                    (b as f32 * brightness_factor).clamp(0.0, 255.0) as u8;
+                                *pixel = Rgb([final_r, final_g, final_b]);
+                            } else {
+                                let color_value =
+                                    ((255.0 - brightness) * alpha).clamp(0.0, 255.0) as u8;
+                                *pixel = Rgb([color_value, color_value, color_value]);
+                            }
                         }
                     }
                 }
@@ -613,15 +1033,15 @@ const FONT8X8_BASIC: [[u8; 8]; 128] = [
     [0x00, 0x00, 0xFC, 0x00, 0x00, 0xFC, 0x00, 0x00], // U+003D (=)
     [0x60, 0x30, 0x18, 0x0C, 0x18, 0x30, 0x60, 0x00], // U+003E (>)
     [0x78, 0xCC, 0x0C, 0x18, 0x30, 0x00, 0x30, 0x00], // U+003F (?)
-    [0x7C, 0xC6, 0xDE, 0xDE, 0xDE, 0xC0, 0x78, 0x00], // U+0040 (@)
-    [0x30, 0x78, 0xCC, 0xCC, 0xFC, 0xCC, 0xCC, 0x00], // U+0041 (A)
+    [0x7C, 0xC6, 0x8C, 0x18, 0x32, 0x66, 0xFE, 0x00], // U+0040 (@)
+    [0xFC, 0x66, 0x66, 0x7C, 0x66, 0x66, 0xFC, 0x00], // U+0041 (A)
     [0xFC, 0x66, 0x66, 0x7C, 0x66, 0x66, 0xFC, 0x00], // U+0042 (B)
     [0x3C, 0x66, 0xC0, 0xC0, 0xC0, 0x66, 0x3C, 0x00], // U+0043 (C)
-    [0xF8, 0x6C, 0x66, 0x66, 0x66, 0x6C, 0xF8, 0x00], // U+0044 (D)
+    [0x78, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0x78, 0x00], // U+0044 (D)
     [0xFE, 0x62, 0x68, 0x78, 0x68, 0x62, 0xFE, 0x00], // U+0045 (E)
     [0xFE, 0x62, 0x68, 0x78, 0x68, 0x60, 0xF0, 0x00], // U+0046 (F)
     [0x3C, 0x66, 0xC0, 0xC0, 0xCE, 0x66, 0x3E, 0x00], // U+0047 (G)
-    [0xCC, 0xCC, 0xCC, 0xFC, 0xCC, 0xCC, 0xCC, 0x00], // U+0048 (H)
+    [0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0x00], // U+0048 (H)
     [0x78, 0x30, 0x30, 0x30, 0x30, 0x30, 0x78, 0x00], // U+0049 (I)
     [0x1E, 0x0C, 0x0C, 0x0C, 0xCC, 0xCC, 0x78, 0x00], // U+004A (J)
     [0xE6, 0x66, 0x6C, 0x78, 0x6C, 0x66, 0xE6, 0x00], // U+004B (K)
@@ -653,7 +1073,7 @@ const FONT8X8_BASIC: [[u8; 8]; 128] = [
     [0x00, 0x00, 0x78, 0xCC, 0xFC, 0xC0, 0x78, 0x00], // U+0065 (e)
     [0x38, 0x6C, 0x60, 0xF0, 0x60, 0x60, 0xF0, 0x00], // U+0066 (f)
     [0x00, 0x00, 0x76, 0xCC, 0xCC, 0x7C, 0x0C, 0xF8], // U+0067 (g)
-    [0xE0, 0x60, 0x6C, 0x76, 0x66, 0x66, 0xE6, 0x00], // U+0068 (h)
+    [0xE0, 0x60, 0x66, 0x6C, 0x78, 0x6C, 0xE6, 0x00], // U+0068 (h)
     [0x30, 0x00, 0x70, 0x30, 0x30, 0x30, 0x78, 0x00], // U+0069 (i)
     [0x0C, 0x00, 0x0C, 0x0C, 0x0C, 0xCC, 0xCC, 0x78], // U+006A (j)
     [0xE0, 0x60, 0x66, 0x6C, 0x78, 0x6C, 0xE6, 0x00], // U+006B (k)
