@@ -55,6 +55,12 @@ pub struct Args {
 
     #[arg(long, default_value = "#15091b")]
     pub bg_color: String,
+
+    #[arg(long, default_value = "1.0")]
+    pub sigma1: f32,
+
+    #[arg(long, default_value = "1.6")]
+    pub sigma2: f32,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -529,11 +535,11 @@ fn apply_floyd_steinberg_dithering(img: RgbImage) -> RgbImage {
 
 fn apply_difference_of_gaussians(
     img: RgbImage,
-    _args: &Args,
+    args: &Args,
 ) -> Result<RgbImage, Box<dyn std::error::Error>> {
     let (width, height) = img.dimensions();
-    let sigma1 = 1.0f32;
-    let sigma2 = sigma1 * 1.6;
+    let sigma1 = args.sigma1;
+    let sigma2 = args.sigma2;
 
     let blur1 = gaussian_blur(&img, sigma1);
     let blur2 = gaussian_blur(&img, sigma2);
