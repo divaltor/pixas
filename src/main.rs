@@ -64,6 +64,9 @@ pub struct Args {
 
     #[arg(long, default_value = "1.2")]
     pub gamma: f32,
+
+    #[arg(long, default_value = "1.0")]
+    pub contrast: f32,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -120,7 +123,7 @@ fn process_image(
         // Alternative processing for no-dither mode
         let _ = analyze_image_complexity(&img);
 
-        processed = apply_enhanced_contrast(processed);
+        processed = apply_enhanced_contrast(processed, args.contrast);
         processed = apply_gamma_correction(processed, args.gamma);
         processed = apply_unsharp_mask(processed);
     }
@@ -170,6 +173,74 @@ fn create_sorted_charset(charset: &str) -> Vec<CharInfo> {
     char_infos
 }
 
+fn create_adaptive_charset(
+    charset_type: &str,
+    image_brightness: f32,
+    contrast_setting: f32,
+) -> Vec<CharInfo> {
+    let base_charset = get_charset_by_type(charset_type);
+    let mut char_infos = create_sorted_charset(base_charset);
+
+    // Calculate expansion factor based on brightness and contrast
+    let brightness_factor = if image_brightness > 180.0 {
+        1.5 // Bright images need more character variety
+    } else if image_brightness > 140.0 {
+        1.3
+    } else {
+        1.0
+    };
+
+    let contrast_factor = contrast_setting.clamp(0.5, 3.0);
+    let expansion_factor = brightness_factor * contrast_factor;
+
+    // If we need more characters and not using full charset already
+    if expansion_factor > 1.2 && charset_type != "full" {
+        // Add additional characters from the full charset
+        let full_charset = FULL_CHARACTERS;
+        let full_char_infos = create_sorted_charset(full_charset);
+
+        // Calculate how many additional characters to include
+        let base_count = char_infos.len();
+        let target_count = ((base_count as f32) * expansion_factor) as usize;
+        let additional_needed = target_count
+            .saturating_sub(base_count)
+            .min(full_char_infos.len().saturating_sub(base_count));
+
+        if additional_needed > 0 {
+            // Add characters from full set that aren't in the base set
+            let base_chars: std::collections::HashSet<char> =
+                char_infos.iter().map(|ci| ci.character).collect();
+
+            let mut additional_chars: Vec<CharInfo> = full_char_infos
+                .into_iter()
+                .filter(|ci| !base_chars.contains(&ci.character))
+                .take(additional_needed)
+                .collect();
+
+            char_infos.append(&mut additional_chars);
+
+            // Re-sort the combined charset
+            char_infos.sort_by(|a, b| a.density.cmp(&b.density));
+        }
+    }
+
+    char_infos
+}
+
+fn calculate_image_brightness(img: &RgbImage) -> f32 {
+    let total_pixels = (img.width() * img.height()) as f32;
+    let mut brightness_sum = 0.0;
+
+    for pixel in img.pixels() {
+        let r = pixel[0] as f32;
+        let g = pixel[1] as f32;
+        let b = pixel[2] as f32;
+        brightness_sum += 0.299 * r + 0.587 * g + 0.114 * b;
+    }
+
+    brightness_sum / total_pixels
+}
+
 fn parse_hex_color(hex: &str) -> Result<(u8, u8, u8), Box<dyn std::error::Error>> {
     let hex = hex.trim_start_matches('#');
     if hex.len() != 6 {
@@ -196,17 +267,19 @@ fn select_character_with_edge(
         // For regular areas, use improved density-based selection
         let normalized_brightness = 1.0 - brightness / 255.0; // 0.0 = bright, 1.0 = dark
 
-        // Apply threshold to prevent overuse of smallest characters
-        // Only use the lightest characters (first 20% of charset) for very bright areas
-        let adjusted_brightness = if normalized_brightness < 0.2 {
-            // For very bright areas, compress to use only lightest 15% of characters
-            normalized_brightness * 0.75
-        } else if normalized_brightness < 0.4 {
-            // For bright areas, slightly compress the range
-            0.15 + (normalized_brightness - 0.2) * 0.8
+        // Much more aggressive thresholding for very bright areas to prevent false dots
+        let adjusted_brightness = if normalized_brightness < 0.1 {
+            // For extremely bright areas (like bright backgrounds), use only space character
+            0.0
+        } else if normalized_brightness < 0.25 {
+            // For very bright areas, heavily compress to use only lightest 10% of characters
+            normalized_brightness * 0.4
+        } else if normalized_brightness < 0.5 {
+            // For bright areas, moderately compress the range
+            0.1 + (normalized_brightness - 0.25) * 0.6
         } else {
-            // For medium to dark areas, use full range starting from 35% of charset
-            0.35 + (normalized_brightness - 0.4) * 1.08
+            // For medium to dark areas, use fuller range starting from 25% of charset
+            0.25 + (normalized_brightness - 0.5) * 1.5
         };
 
         let char_index =
@@ -238,8 +311,9 @@ fn render_to_terminal(
     let ascii_width = term_width.saturating_sub(2); // Leave 1 char margin on each side
     let ascii_height = term_height.saturating_sub(3); // Leave margin for spacing
 
-    let charset = get_charset_by_type(&args.charset_type);
-    let char_infos = create_sorted_charset(charset);
+    // Calculate image brightness for adaptive charset
+    let image_brightness = calculate_image_brightness(img);
+    let char_infos = create_adaptive_charset(&args.charset_type, image_brightness, args.contrast);
 
     // Calculate sampling step sizes
     let step_x = img_width as f32 / ascii_width as f32;
@@ -288,9 +362,14 @@ fn render_to_terminal(
             {
                 let edge = edge_info[sample_y as usize][sample_x as usize];
 
-                // Use higher edge threshold in no-dither mode to reduce false edges
+                // Use adaptive edge threshold in no-dither mode to reduce false edges
                 let effective_threshold = if args.no_dither {
-                    args.edge_threshold * 3.0 // Much higher threshold for no-dither
+                    // More conservative thresholding to prevent false dots on backgrounds
+                    if args.edge_threshold >= 0.3 {
+                        args.edge_threshold * 8.0 // Very high threshold for high user settings
+                    } else {
+                        args.edge_threshold * 5.0 // Still conservative for low user settings
+                    }
                 } else {
                     args.edge_threshold
                 };
@@ -317,19 +396,22 @@ fn render_to_terminal(
                 let color_brightness = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
                 let brightness_factor = color_brightness / 255.0;
 
-                // Apply color intensity with brightness-based modulation
-                let intensity = args.color_intensity;
-                let brightness_adjusted_intensity = intensity * (0.3 + 0.7 * brightness_factor);
+                // Apply color intensity with brightness-based modulation and custom contrast
+                let base_intensity = args.color_intensity;
+                let contrast_boost = args.contrast.clamp(0.5, 3.0);
+                let brightness_adjusted_intensity =
+                    base_intensity * (0.2 + 0.8 * brightness_factor) * contrast_boost;
+                let final_intensity = brightness_adjusted_intensity.clamp(0.0, 2.0);
 
-                let adjusted_r = ((r as f32) * brightness_adjusted_intensity
-                    + (255.0 * (1.0 - brightness_adjusted_intensity)))
-                    as u8;
-                let adjusted_g = ((g as f32) * brightness_adjusted_intensity
-                    + (255.0 * (1.0 - brightness_adjusted_intensity)))
-                    as u8;
-                let adjusted_b = ((b as f32) * brightness_adjusted_intensity
-                    + (255.0 * (1.0 - brightness_adjusted_intensity)))
-                    as u8;
+                let adjusted_r = ((r as f32) * final_intensity
+                    + (255.0 * (1.0 - final_intensity.min(1.0))))
+                .clamp(0.0, 255.0) as u8;
+                let adjusted_g = ((g as f32) * final_intensity
+                    + (255.0 * (1.0 - final_intensity.min(1.0))))
+                .clamp(0.0, 255.0) as u8;
+                let adjusted_b = ((b as f32) * final_intensity
+                    + (255.0 * (1.0 - final_intensity.min(1.0))))
+                .clamp(0.0, 255.0) as u8;
 
                 print!(
                     "{}{}",
@@ -691,8 +773,14 @@ fn render_to_ascii(
     args: &Args,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (width, height) = img.dimensions();
-    let charset = get_charset_by_type(&args.charset_type);
-    let char_infos = create_sorted_charset(charset);
+
+    // Calculate image brightness for adaptive charset
+    let image_brightness = if let Some(color_img_ref) = color_img {
+        calculate_image_brightness(color_img_ref)
+    } else {
+        calculate_image_brightness(img)
+    };
+    let char_infos = create_adaptive_charset(&args.charset_type, image_brightness, args.contrast);
 
     // Parse colors
     let fg_color = parse_hex_color(&args.fg_color)?;
@@ -765,9 +853,14 @@ fn render_to_ascii(
                 let edge_x = (x / args.cell_size) as usize;
                 let edge = edge_info[edge_y][edge_x];
 
-                // Use higher edge threshold in no-dither mode to reduce false edges
+                // Use adaptive edge threshold in no-dither mode to reduce false edges
                 let effective_threshold = if args.no_dither {
-                    args.edge_threshold * 3.0 // Much higher threshold for no-dither
+                    // More conservative thresholding to prevent false dots on backgrounds
+                    if args.edge_threshold >= 0.3 {
+                        args.edge_threshold * 8.0 // Very high threshold for high user settings
+                    } else {
+                        args.edge_threshold * 5.0 // Still conservative for low user settings
+                    }
                 } else {
                     args.edge_threshold
                 };
@@ -795,22 +888,27 @@ fn render_to_ascii(
                 // Calculate brightness factor for color intensity adjustment
                 let brightness_factor = selection_brightness / 255.0;
 
-                // Apply color intensity with brightness-based modulation
-                let intensity = args.color_intensity;
+                // Apply color intensity with brightness-based modulation and custom contrast
+                let base_intensity = args.color_intensity;
+                let contrast_boost = args.contrast.clamp(0.5, 3.0);
 
                 // Darker areas get more color intensity, brighter areas get less
-                // This creates better contrast between light and dark regions
-                let brightness_adjusted_intensity = intensity * (0.3 + 0.7 * brightness_factor);
+                // Enhanced with custom contrast setting
+                let brightness_adjusted_intensity =
+                    base_intensity * (0.2 + 0.8 * brightness_factor) * contrast_boost;
 
-                let final_r = ((avg_r as f32) * brightness_adjusted_intensity
-                    + (fg_color.0 as f32) * (1.0 - brightness_adjusted_intensity))
-                    as u8;
-                let final_g = ((avg_g as f32) * brightness_adjusted_intensity
-                    + (fg_color.1 as f32) * (1.0 - brightness_adjusted_intensity))
-                    as u8;
-                let final_b = ((avg_b as f32) * brightness_adjusted_intensity
-                    + (fg_color.2 as f32) * (1.0 - brightness_adjusted_intensity))
-                    as u8;
+                // Ensure we don't exceed reasonable bounds
+                let final_intensity = brightness_adjusted_intensity.clamp(0.0, 2.0);
+
+                let final_r = ((avg_r as f32) * final_intensity
+                    + (fg_color.0 as f32) * (1.0 - final_intensity.min(1.0)))
+                .clamp(0.0, 255.0) as u8;
+                let final_g = ((avg_g as f32) * final_intensity
+                    + (fg_color.1 as f32) * (1.0 - final_intensity.min(1.0)))
+                .clamp(0.0, 255.0) as u8;
+                let final_b = ((avg_b as f32) * final_intensity
+                    + (fg_color.2 as f32) * (1.0 - final_intensity.min(1.0)))
+                .clamp(0.0, 255.0) as u8;
 
                 (final_r, final_g, final_b)
             } else {
@@ -881,7 +979,7 @@ fn render_ascii_char_to_image(
     }
 }
 
-fn apply_enhanced_contrast(img: RgbImage) -> RgbImage {
+fn apply_enhanced_contrast(img: RgbImage, custom_contrast: f32) -> RgbImage {
     let (width, height) = img.dimensions();
     let mut histogram = [0u32; 256];
 
@@ -899,14 +997,17 @@ fn apply_enhanced_contrast(img: RgbImage) -> RgbImage {
     }
     let avg_brightness = brightness_sum / total_pixels;
 
-    // Adaptive clipping based on image brightness
-    let clip_percent = if avg_brightness > 180.0 {
+    // Adaptive clipping based on image brightness and custom contrast
+    let base_clip_percent = if avg_brightness > 180.0 {
         0.05 // More aggressive clipping for bright images
     } else if avg_brightness > 120.0 {
         0.03 // Medium clipping for medium brightness
     } else {
         0.02 // Standard clipping for dark images
     };
+
+    // Increase clipping with higher contrast settings for more dramatic effect
+    let clip_percent = (base_clip_percent * custom_contrast.clamp(0.5, 3.0)).min(0.15);
 
     let clip_threshold = (total_pixels * clip_percent) as u32;
 
@@ -952,7 +1053,10 @@ fn apply_enhanced_contrast(img: RgbImage) -> RgbImage {
 
         // Apply enhanced S-curve for better contrast, especially for bright images
         let normalized = linear_value / 255.0;
-        let contrast_factor = if avg_brightness > 160.0 { 1.8 } else { 1.4 };
+        let base_contrast_factor = if avg_brightness > 160.0 { 1.8 } else { 1.4 };
+
+        // Scale contrast factor with custom contrast parameter
+        let contrast_factor = base_contrast_factor * custom_contrast.clamp(0.5, 3.0);
 
         // Enhanced S-curve with adjustable contrast
         let enhanced_curve = if normalized < 0.5 {
