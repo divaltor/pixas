@@ -128,12 +128,6 @@ fn process_image(
     // Compute edge information
     let edge_info = compute_edge_information(&processed);
 
-    // Only apply edge tangent flow when dithering is enabled
-    // This prevents the diagonal line artifacts in no-dither mode
-    if !args.no_dither {
-        processed = apply_edge_tangent_flow(processed, args)?;
-    }
-
     Ok((processed, edge_info, color_img))
 }
 
@@ -189,7 +183,7 @@ fn parse_hex_color(hex: &str) -> Result<(u8, u8, u8), Box<dyn std::error::Error>
     Ok((r, g, b))
 }
 
-fn select_character_with_flow(
+fn select_character_with_edge(
     brightness: f32,
     edge_info: &EdgeInfo,
     char_infos: &[CharInfo],
@@ -199,19 +193,10 @@ fn select_character_with_flow(
         // For strong edges, use directional characters
         get_edge_character(edge_info.direction)
     } else {
-        // For regular areas, use density-based selection with flow influence
-        let base_index =
+        // For regular areas, use simple density-based selection
+        let char_index =
             ((1.0 - brightness / 255.0) * (char_infos.len() - 1) as f32).round() as usize;
-        let base_index = base_index.min(char_infos.len() - 1);
-
-        // Apply flow-based perturbation for more organic selection
-        let flow_influence = (edge_info.magnitude * 2.0).min(1.0); // Normalize to 0-1
-        let perturbation = (flow_influence * 2.0 - 1.0) * 2.0; // -2 to +2 range
-
-        let adjusted_index = (base_index as f32 + perturbation).round() as i32;
-        let final_index = adjusted_index.clamp(0, char_infos.len() as i32 - 1) as usize;
-
-        char_infos[final_index].character
+        char_infos[char_index.min(char_infos.len() - 1)].character
     }
 }
 
@@ -296,7 +281,7 @@ fn render_to_terminal(
                 };
 
                 // For terminal, we use normal brightness mapping (not inverted)
-                select_character_with_flow(
+                select_character_with_edge(
                     255.0 - selection_brightness,
                     &edge,
                     &char_infos,
@@ -628,83 +613,6 @@ fn gaussian_weight(sigma: f32, distance: f32) -> f32 {
         * (-distance * distance / two_sigma_sq).exp()
 }
 
-fn apply_edge_tangent_flow(
-    img: RgbImage,
-    _args: &Args,
-) -> Result<RgbImage, Box<dyn std::error::Error>> {
-    let (width, height) = img.dimensions();
-    let structure_tensor = compute_structure_tensor(&img);
-    let flow_field = compute_edge_tangent_flow(&structure_tensor);
-
-    let mut output = RgbImage::new(width, height);
-
-    for (x, y, pixel) in img.enumerate_pixels() {
-        let flow = flow_field.get_pixel(x, y);
-        let dx = (flow[0] as f32 - 127.5) / 127.5;
-        let dy = (flow[1] as f32 - 127.5) / 127.5;
-
-        let nx = x as f32 + dx * 2.0;
-        let ny = y as f32 + dy * 2.0;
-
-        if nx >= 0.0 && nx < width as f32 && ny >= 0.0 && ny < height as f32 {
-            let sample_pixel = img.get_pixel(nx as u32, ny as u32);
-            let enhanced = ((pixel[0] as f32 + sample_pixel[0] as f32) / 2.0) as u8;
-            output.put_pixel(x, y, Rgb([enhanced, enhanced, enhanced]));
-        } else {
-            output.put_pixel(x, y, *pixel);
-        }
-    }
-
-    Ok(output)
-}
-
-fn compute_structure_tensor(img: &RgbImage) -> RgbImage {
-    let (width, height) = img.dimensions();
-    let mut tensor = RgbImage::new(width, height);
-
-    for y in 1..height - 1 {
-        for x in 1..width - 1 {
-            let gx = sobel_x(img, x, y);
-            let gy = sobel_y(img, x, y);
-
-            let gxx = (gx * gx * 255.0) as u8;
-            let gyy = (gy * gy * 255.0) as u8;
-            let gxy = (gx * gy * 255.0) as u8;
-
-            tensor.put_pixel(x, y, Rgb([gxx, gyy, gxy]));
-        }
-    }
-
-    tensor
-}
-
-fn compute_edge_tangent_flow(tensor: &RgbImage) -> RgbImage {
-    let (width, height) = tensor.dimensions();
-    let mut flow = RgbImage::new(width, height);
-
-    for (x, y, pixel) in tensor.enumerate_pixels() {
-        let gxx = pixel[0] as f32 / 255.0;
-        let gyy = pixel[1] as f32 / 255.0;
-        let gxy = pixel[2] as f32 / 255.0;
-
-        let lambda1 =
-            0.5 * (gyy + gxx + (gyy * gyy - 2.0 * gxx * gyy + gxx * gxx + 4.0 * gxy * gxy).sqrt());
-        let dx = gxx - lambda1;
-        let dy = gxy;
-
-        let length = (dx * dx + dy * dy).sqrt();
-        let normalized_dx = if length > 0.0 { dx / length } else { 0.0 };
-        let normalized_dy = if length > 0.0 { dy / length } else { 1.0 };
-
-        let flow_x = ((normalized_dx + 1.0) * 127.5) as u8;
-        let flow_y = ((normalized_dy + 1.0) * 127.5) as u8;
-
-        flow.put_pixel(x, y, Rgb([flow_x, flow_y, 0]));
-    }
-
-    flow
-}
-
 fn sobel_x(img: &RgbImage, x: u32, y: u32) -> f32 {
     let tl = img.get_pixel(x - 1, y - 1)[0] as f32;
     let _tm = img.get_pixel(x, y - 1)[0] as f32;
@@ -817,7 +725,7 @@ fn render_to_ascii(
                     args.edge_threshold
                 };
 
-                select_character_with_flow(
+                select_character_with_edge(
                     selection_brightness,
                     &edge,
                     &char_infos,
