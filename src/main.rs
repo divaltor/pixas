@@ -41,7 +41,7 @@ pub struct Args {
     #[arg(long, default_value = "ascii")]
     pub charset_type: String,
 
-    #[arg(long, default_value = "0.2")]
+    #[arg(long, default_value = "0.1")]
     pub edge_threshold: f32,
 
     #[arg(long)]
@@ -273,41 +273,63 @@ fn render_to_terminal(
 
             let avg_brightness = total_brightness / pixel_count as f32;
 
+            // Calculate brightness for character selection from original color image
+            let selection_brightness = if args.color && color_img.is_some() {
+                let color_img = color_img.as_ref().unwrap();
+                let (r, g, b) = get_average_color(color_img, sample_x, sample_y, sample_size);
+                0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32
+            } else {
+                avg_brightness
+            };
+
             // Use flow-based character selection for terminal
-            let ascii_char =
-                if sample_y < edge_info.len() as u32 && sample_x < edge_info[0].len() as u32 {
-                    let edge = edge_info[sample_y as usize][sample_x as usize];
+            let ascii_char = if sample_y < edge_info.len() as u32
+                && sample_x < edge_info[0].len() as u32
+            {
+                let edge = edge_info[sample_y as usize][sample_x as usize];
 
-                    // Use higher edge threshold in no-dither mode to reduce false edges
-                    let effective_threshold = if args.no_dither {
-                        args.edge_threshold * 3.0 // Much higher threshold for no-dither
-                    } else {
-                        args.edge_threshold
-                    };
-
-                    // For terminal, we use normal brightness mapping (not inverted)
-                    select_character_with_flow(
-                        255.0 - avg_brightness,
-                        &edge,
-                        &char_infos,
-                        effective_threshold,
-                    )
+                // Use higher edge threshold in no-dither mode to reduce false edges
+                let effective_threshold = if args.no_dither {
+                    args.edge_threshold * 3.0 // Much higher threshold for no-dither
                 } else {
-                    // Fallback to simple brightness mapping (normal mapping for white text on black background)
-                    let char_index =
-                        ((avg_brightness / 255.0) * (char_infos.len() - 1) as f32).round() as usize;
-                    char_infos[char_index.min(char_infos.len() - 1)].character
+                    args.edge_threshold
                 };
+
+                // For terminal, we use normal brightness mapping (not inverted)
+                select_character_with_flow(
+                    255.0 - selection_brightness,
+                    &edge,
+                    &char_infos,
+                    effective_threshold,
+                )
+            } else {
+                // Fallback to simple brightness mapping using original color brightness
+                let char_index = ((selection_brightness / 255.0) * (char_infos.len() - 1) as f32)
+                    .round() as usize;
+                char_infos[char_index.min(char_infos.len() - 1)].character
+            };
 
             if args.color && color_img.is_some() {
                 let color_img = color_img.as_ref().unwrap();
                 let (r, g, b) = get_average_color(color_img, sample_x, sample_y, sample_size);
 
-                // Apply color intensity
+                // Calculate brightness for terminal color adjustment
+                let color_brightness = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+                let brightness_factor = color_brightness / 255.0;
+
+                // Apply color intensity with brightness-based modulation
                 let intensity = args.color_intensity;
-                let adjusted_r = ((r as f32) * intensity + (255.0 * (1.0 - intensity))) as u8;
-                let adjusted_g = ((g as f32) * intensity + (255.0 * (1.0 - intensity))) as u8;
-                let adjusted_b = ((b as f32) * intensity + (255.0 * (1.0 - intensity))) as u8;
+                let brightness_adjusted_intensity = intensity * (0.3 + 0.7 * brightness_factor);
+
+                let adjusted_r = ((r as f32) * brightness_adjusted_intensity
+                    + (255.0 * (1.0 - brightness_adjusted_intensity)))
+                    as u8;
+                let adjusted_g = ((g as f32) * brightness_adjusted_intensity
+                    + (255.0 * (1.0 - brightness_adjusted_intensity)))
+                    as u8;
+                let adjusted_b = ((b as f32) * brightness_adjusted_intensity
+                    + (255.0 * (1.0 - brightness_adjusted_intensity)))
+                    as u8;
 
                 print!(
                     "{}{}",
@@ -768,6 +790,18 @@ fn render_to_ascii(
                 0.0
             };
 
+            // Calculate brightness from original color image for character selection
+            let selection_brightness = if args.color && color_img.is_some() && pixel_count > 0 {
+                // Use the original color image brightness for character selection
+                let color_brightness = 0.299 * (total_r / pixel_count as f32)
+                    + 0.587 * (total_g / pixel_count as f32)
+                    + 0.114 * (total_b / pixel_count as f32);
+                color_brightness
+            } else {
+                // Use processed image brightness
+                avg_brightness
+            };
+
             // Select character based on brightness and edge info
             let ascii_char = if (y / args.cell_size) < edge_info.len() as u32
                 && (x / args.cell_size) < edge_info[0].len() as u32
@@ -783,10 +817,16 @@ fn render_to_ascii(
                     args.edge_threshold
                 };
 
-                select_character_with_flow(avg_brightness, &edge, &char_infos, effective_threshold)
+                select_character_with_flow(
+                    selection_brightness,
+                    &edge,
+                    &char_infos,
+                    effective_threshold,
+                )
             } else {
-                // Fallback to simple brightness mapping
-                let char_index = ((1.0 - avg_brightness / 255.0) * (char_infos.len() - 1) as f32)
+                // Fallback to simple brightness mapping using original image brightness
+                let char_index = ((1.0 - selection_brightness / 255.0)
+                    * (char_infos.len() - 1) as f32)
                     .round() as usize;
                 char_infos[char_index.min(char_infos.len() - 1)].character
             };
@@ -797,14 +837,26 @@ fn render_to_ascii(
                 let avg_g = (total_g / pixel_count as f32) as u8;
                 let avg_b = (total_b / pixel_count as f32) as u8;
 
-                // Apply color intensity
+                // Calculate brightness factor for color intensity adjustment
+                let brightness_factor = selection_brightness / 255.0;
+
+                // Apply color intensity with brightness-based modulation
                 let intensity = args.color_intensity;
-                let final_r =
-                    ((avg_r as f32) * intensity + (fg_color.0 as f32) * (1.0 - intensity)) as u8;
-                let final_g =
-                    ((avg_g as f32) * intensity + (fg_color.1 as f32) * (1.0 - intensity)) as u8;
-                let final_b =
-                    ((avg_b as f32) * intensity + (fg_color.2 as f32) * (1.0 - intensity)) as u8;
+
+                // Darker areas get more color intensity, brighter areas get less
+                // This creates better contrast between light and dark regions
+                let brightness_adjusted_intensity = intensity * (0.3 + 0.7 * brightness_factor);
+
+                let final_r = ((avg_r as f32) * brightness_adjusted_intensity
+                    + (fg_color.0 as f32) * (1.0 - brightness_adjusted_intensity))
+                    as u8;
+                let final_g = ((avg_g as f32) * brightness_adjusted_intensity
+                    + (fg_color.1 as f32) * (1.0 - brightness_adjusted_intensity))
+                    as u8;
+                let final_b = ((avg_b as f32) * brightness_adjusted_intensity
+                    + (fg_color.2 as f32) * (1.0 - brightness_adjusted_intensity))
+                    as u8;
+
                 (final_r, final_g, final_b)
             } else {
                 fg_color
