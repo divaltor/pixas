@@ -16,9 +16,8 @@ struct CharInfo {
     density: usize, // Number of set pixels in bitmap
 }
 
-#[derive(Parser)]
-#[command(name = "pixas")]
-#[command(about = "ASCII art generator with pencil-like drawing effects")]
+#[derive(Parser, Debug, Clone)]
+#[command(author, version, about, long_about = None)]
 pub struct Args {
     #[arg(short, long, default_value = "input.jpg")]
     pub input: PathBuf,
@@ -53,7 +52,7 @@ pub struct Args {
     #[arg(long, default_value = "#2d2d2d")]
     pub fg_color: String,
 
-    #[arg(long, default_value = "#ffffff")]
+    #[arg(long, default_value = "#15091b")]
     pub bg_color: String,
 
     #[arg(long, default_value = "1.0")]
@@ -64,29 +63,42 @@ pub struct Args {
 
     #[arg(long, default_value = "1.0")]
     pub gamma: f32,
+
+    #[arg(long, default_value = "1.0")]
+    pub exposure: f32,
+
+    #[arg(long, default_value = "1.0")]
+    pub attenuation: f32,
+
+    #[arg(long)]
+    pub invert_luminance: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    let img = image::open(&args.input)?.to_rgb8();
+    let img = image::open(&args.input)?;
+    let img = img.to_rgb8();
 
-    // Add diagnostic information
-    println!("Image info: {}x{}", img.width(), img.height());
-    analyze_image_characteristics(&img);
-
-    let upscaled_img = if args.upscale_factor > 1.0 {
+    let upscaled_img = if args.upscale_factor != 1.0 {
         upscale_image(img, args.upscale_factor)?
     } else {
         img
     };
 
-    let (processed_img, edge_info, color_img) = process_image(upscaled_img, &args)?;
+    let (processed_img, edge_info, color_img, final_exposure, final_attenuation, final_invert) =
+        process_image(upscaled_img, &args)?;
+
+    // Create modified args with final exposure values
+    let mut final_args = args.clone();
+    final_args.exposure = final_exposure;
+    final_args.attenuation = final_attenuation;
+    final_args.invert_luminance = final_invert;
 
     if args.terminal {
-        render_to_terminal(&processed_img, &edge_info, &color_img, &args)?;
+        render_to_terminal(&processed_img, &edge_info, &color_img, &final_args)?;
     } else {
-        render_to_ascii(&processed_img, &edge_info, &color_img, &args)?;
+        render_to_ascii(&processed_img, &edge_info, &color_img, &final_args)?;
     }
 
     Ok(())
@@ -107,34 +119,78 @@ fn upscale_image(img: RgbImage, scale_factor: f32) -> Result<RgbImage, Box<dyn s
 fn process_image(
     img: RgbImage,
     args: &Args,
-) -> Result<(RgbImage, Vec<Vec<EdgeInfo>>, Option<RgbImage>), Box<dyn std::error::Error>> {
-    // Keep original color image if color mode is enabled
+) -> Result<
+    (
+        RgbImage,
+        Vec<Vec<EdgeInfo>>,
+        Option<RgbImage>,
+        f32,
+        f32,
+        bool,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let color_img = if args.color { Some(img.clone()) } else { None };
 
-    let mut processed = apply_grayscale_and_tone_mapping(img.clone());
+    // Calculate content-aware exposure if using defaults
+    let (calculated_exposure, calculated_attenuation, calculated_invert) =
+        calculate_content_aware_exposure(&img);
 
-    if !args.no_dither {
-        processed = apply_floyd_steinberg_dithering(processed);
-        processed = apply_difference_of_gaussians(processed, args)?;
+    // Use calculated values only if user hasn't specified custom values
+    let final_exposure = if args.exposure == 1.0 {
+        calculated_exposure
     } else {
-        // Alternative processing for no-dither mode
-        let _ = analyze_image_complexity(&img);
+        args.exposure
+    };
+    let final_attenuation = if args.attenuation == 1.0 {
+        calculated_attenuation
+    } else {
+        args.attenuation
+    };
+    let final_invert = if !args.invert_luminance {
+        calculated_invert
+    } else {
+        args.invert_luminance
+    };
 
-        processed = apply_enhanced_contrast(processed);
-        processed = apply_gamma_correction(processed, args.gamma);
-        processed = apply_unsharp_mask(processed);
-    }
+    // Print exposure analysis for debugging
+    println!("Content-aware exposure analysis:");
+    println!("  Calculated exposure: {:.2}", calculated_exposure);
+    println!("  Calculated attenuation: {:.2}", calculated_attenuation);
+    println!("  Calculated invert: {}", calculated_invert);
+    println!("  Using exposure: {:.2}", final_exposure);
+    println!("  Using attenuation: {:.2}", final_attenuation);
+    println!("  Using invert: {}", final_invert);
 
-    // Compute edge information
-    let edge_info = compute_edge_information(&processed);
+    let processed_img = if args.no_dither {
+        analyze_image_characteristics(&img);
 
-    Ok((processed, edge_info, color_img))
+        let grayscale = apply_grayscale_and_tone_mapping(img);
+        let enhanced = apply_enhanced_contrast(grayscale);
+        let gamma_corrected = apply_gamma_correction(enhanced, args.gamma);
+        apply_unsharp_mask(gamma_corrected)
+    } else {
+        let grayscale = apply_grayscale_and_tone_mapping(img);
+        let dithered = apply_floyd_steinberg_dithering(grayscale);
+        apply_difference_of_gaussians(dithered, args)?
+    };
+
+    let edge_info = compute_edge_information(&processed_img);
+
+    Ok((
+        processed_img,
+        edge_info,
+        color_img,
+        final_exposure,
+        final_attenuation,
+        final_invert,
+    ))
 }
 
 const DEFAULT_BLOCK: &str = " .:coPO?@█";
 const DEFAULT_ASCII: &str = " .:-=+*%@#";
 const FULL_CHARACTERS: &str =
-    " .-:=+iltIcsv1x%7aejorzfnuCJT3*69LYpqy25SbdgFGOVXkPhmw48AQDEHKUZR@B#NW0M";
+    " .-:=+iltIcsv1x%7aejorzfnuCJT3*69LYpqy5SbdgFGOVXkPhmw48AQDEHKUZR@B#NW0M";
 
 // Edge direction characters
 const EDGE_HORIZONTAL: char = '-';
@@ -183,19 +239,140 @@ fn parse_hex_color(hex: &str) -> Result<(u8, u8, u8), Box<dyn std::error::Error>
     Ok((r, g, b))
 }
 
+fn calculate_content_aware_exposure(img: &RgbImage) -> (f32, f32, bool) {
+    let mut dark_pixels = 0;
+    let mut bright_pixels = 0;
+    let mut mid_tone_sum = 0.0;
+    let mut mid_tone_count = 0;
+    let mut total_luminance = 0.0;
+    let total_pixels = (img.width() * img.height()) as f32;
+
+    for pixel in img.pixels() {
+        let luminance =
+            (0.299 * pixel[0] as f32 + 0.587 * pixel[1] as f32 + 0.114 * pixel[2] as f32) / 255.0;
+
+        total_luminance += luminance;
+
+        if luminance < 0.25 {
+            dark_pixels += 1;
+        } else if luminance > 0.75 {
+            bright_pixels += 1;
+        } else {
+            mid_tone_sum += luminance;
+            mid_tone_count += 1;
+        }
+    }
+
+    let average_luminance = total_luminance / total_pixels;
+    let dark_ratio = dark_pixels as f32 / total_pixels;
+    let bright_ratio = bright_pixels as f32 / total_pixels;
+
+    // Calculate exposure compensation
+    let exposure = if dark_ratio > 0.6 {
+        // Very dark image - boost exposure significantly
+        let boost = 1.5 + (dark_ratio - 0.6) * 2.0; // 1.5x to 2.3x boost
+        boost.min(3.0)
+    } else if bright_ratio > 0.6 {
+        // Very bright image - reduce exposure
+        let reduction = 0.7 - (bright_ratio - 0.6) * 0.5; // 0.7x to 0.5x reduction
+        reduction.max(0.3)
+    } else if average_luminance < 0.3 {
+        // Generally dark image
+        1.0 + (0.3 - average_luminance) * 2.0 // Up to 1.6x boost
+    } else if average_luminance > 0.7 {
+        // Generally bright image
+        1.0 - (average_luminance - 0.7) * 1.0 // Down to 0.7x
+    } else {
+        // Well-balanced image
+        1.0
+    };
+
+    // Calculate attenuation (contrast curve)
+    let contrast_ratio = if mid_tone_count > 0 {
+        // Calculate contrast in mid-tones
+        let mid_tone_avg = mid_tone_sum / mid_tone_count as f32;
+        let mut variance = 0.0;
+        let mut variance_count = 0;
+
+        for pixel in img.pixels() {
+            let luminance =
+                (0.299 * pixel[0] as f32 + 0.587 * pixel[1] as f32 + 0.114 * pixel[2] as f32)
+                    / 255.0;
+
+            if luminance >= 0.25 && luminance <= 0.75 {
+                let diff = luminance - mid_tone_avg;
+                variance += diff * diff;
+                variance_count += 1;
+            }
+        }
+
+        if variance_count > 0 {
+            (variance / variance_count as f32).sqrt()
+        } else {
+            0.1
+        }
+    } else {
+        0.1
+    };
+
+    let attenuation = if contrast_ratio < 0.15 {
+        // Low contrast - increase contrast curve
+        0.8
+    } else if contrast_ratio > 0.3 {
+        // High contrast - flatten curve slightly
+        1.2
+    } else {
+        // Good contrast - linear response
+        1.0
+    };
+
+    // Determine inversion based on overall brightness
+    let invert = average_luminance > 0.65 && bright_ratio > 0.4;
+
+    (exposure, attenuation, invert)
+}
+
+fn apply_exposure_processing(luminance: f32, exposure: f32, attenuation: f32, invert: bool) -> f32 {
+    // Apply exposure (like AcerolaFX)
+    let mut result = (luminance * exposure).clamp(0.0, 1.0);
+
+    // Apply attenuation curve (contrast adjustment)
+    result = result.powf(attenuation);
+
+    // Apply inversion if needed
+    if invert {
+        result = 1.0 - result;
+    }
+
+    // Quantize to discrete levels for cleaner ASCII output (like AcerolaFX)
+    let quantized = ((result * 10.0).floor().max(0.0) - 1.0).max(0.0) / 10.0;
+    quantized
+}
+
 fn select_character_with_edge(
     brightness: f32,
     edge_info: &EdgeInfo,
     char_infos: &[CharInfo],
     edge_threshold: f32,
+    exposure: f32,
+    attenuation: f32,
+    invert_luminance: bool,
 ) -> char {
     if edge_info.magnitude > edge_threshold {
         // For strong edges, use directional characters
         get_edge_character(edge_info.direction)
     } else {
-        // For regular areas, use simple density-based selection
-        let char_index =
-            ((1.0 - brightness / 255.0) * (char_infos.len() - 1) as f32).round() as usize;
+        // Apply exposure processing to brightness
+        let normalized_brightness = brightness / 255.0;
+        let processed_luminance = apply_exposure_processing(
+            normalized_brightness,
+            exposure,
+            attenuation,
+            invert_luminance,
+        );
+
+        // Map processed luminance to character index
+        let char_index = (processed_luminance * (char_infos.len() - 1) as f32).round() as usize;
         char_infos[char_index.min(char_infos.len() - 1)].character
     }
 }
@@ -286,6 +463,9 @@ fn render_to_terminal(
                     &edge,
                     &char_infos,
                     effective_threshold,
+                    args.exposure,
+                    args.attenuation,
+                    args.invert_luminance,
                 )
             } else {
                 // Fallback to simple brightness mapping using original color brightness
@@ -730,6 +910,9 @@ fn render_to_ascii(
                     &edge,
                     &char_infos,
                     effective_threshold,
+                    args.exposure,
+                    args.attenuation,
+                    args.invert_luminance,
                 )
             } else {
                 // Fallback to simple brightness mapping using original image brightness
