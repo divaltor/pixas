@@ -41,7 +41,7 @@ pub struct Args {
     #[arg(long, default_value = "ascii")]
     pub charset_type: String,
 
-    #[arg(long, default_value = "0.1")]
+    #[arg(long, default_value = "0.2")]
     pub edge_threshold: f32,
 
     #[arg(long)]
@@ -50,10 +50,10 @@ pub struct Args {
     #[arg(long, default_value = "1")]
     pub color_intensity: f32,
 
-    #[arg(long, default_value = "#ffffff")]
+    #[arg(long, default_value = "#2d2d2d")]
     pub fg_color: String,
 
-    #[arg(long, default_value = "#15091b")]
+    #[arg(long, default_value = "#ffffff")]
     pub bg_color: String,
 
     #[arg(long, default_value = "1.0")]
@@ -61,6 +61,9 @@ pub struct Args {
 
     #[arg(long, default_value = "1.6")]
     pub sigma2: f32,
+
+    #[arg(long, default_value = "1.0")]
+    pub gamma: f32,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -115,21 +118,21 @@ fn process_image(
         processed = apply_difference_of_gaussians(processed, args)?;
     } else {
         // Alternative processing for no-dither mode
-        #[cfg(debug_assertions)]
-        {
-            let complexity = analyze_image_complexity(&img);
-            println!("Image complexity score: {:.2}", complexity);
-        }
+        let _ = analyze_image_complexity(&img);
 
         processed = apply_enhanced_contrast(processed);
-        processed = apply_gamma_correction(processed, 1.4);
+        processed = apply_gamma_correction(processed, args.gamma);
         processed = apply_unsharp_mask(processed);
     }
 
     // Compute edge information
     let edge_info = compute_edge_information(&processed);
 
-    processed = apply_edge_tangent_flow(processed, args)?;
+    // Only apply edge tangent flow when dithering is enabled
+    // This prevents the diagonal line artifacts in no-dither mode
+    if !args.no_dither {
+        processed = apply_edge_tangent_flow(processed, args)?;
+    }
 
     Ok((processed, edge_info, color_img))
 }
@@ -274,12 +277,20 @@ fn render_to_terminal(
             let ascii_char =
                 if sample_y < edge_info.len() as u32 && sample_x < edge_info[0].len() as u32 {
                     let edge = edge_info[sample_y as usize][sample_x as usize];
+
+                    // Use higher edge threshold in no-dither mode to reduce false edges
+                    let effective_threshold = if args.no_dither {
+                        args.edge_threshold * 3.0 // Much higher threshold for no-dither
+                    } else {
+                        args.edge_threshold
+                    };
+
                     // For terminal, we use normal brightness mapping (not inverted)
                     select_character_with_flow(
                         255.0 - avg_brightness,
                         &edge,
                         &char_infos,
-                        args.edge_threshold,
+                        effective_threshold,
                     )
                 } else {
                     // Fallback to simple brightness mapping (normal mapping for white text on black background)
@@ -765,7 +776,14 @@ fn render_to_ascii(
                 let edge_x = (x / args.cell_size) as usize;
                 let edge = edge_info[edge_y][edge_x];
 
-                select_character_with_flow(avg_brightness, &edge, &char_infos, args.edge_threshold)
+                // Use higher edge threshold in no-dither mode to reduce false edges
+                let effective_threshold = if args.no_dither {
+                    args.edge_threshold * 3.0 // Much higher threshold for no-dither
+                } else {
+                    args.edge_threshold
+                };
+
+                select_character_with_flow(avg_brightness, &edge, &char_infos, effective_threshold)
             } else {
                 // Fallback to simple brightness mapping
                 let char_index = ((1.0 - avg_brightness / 255.0) * (char_infos.len() - 1) as f32)
@@ -951,7 +969,7 @@ fn apply_unsharp_mask(img: RgbImage) -> RgbImage {
     let mut output = RgbImage::new(width, height);
 
     let amount = 1.5; // Sharpening strength
-    let threshold = 0; // Minimum difference to apply sharpening
+    let threshold = 0.05; // Minimum difference to apply sharpening
 
     for (x, y, pixel) in img.enumerate_pixels() {
         let original = pixel[0] as f32;
@@ -1038,55 +1056,61 @@ fn analyze_image_characteristics(_img: &RgbImage) {
     }
 }
 
-fn analyze_image_complexity(img: &RgbImage) -> f32 {
-    let (width, height) = img.dimensions();
-    let total_pixels = (width * height) as f32;
+fn analyze_image_complexity(_img: &RgbImage) -> Result<(), ()> {
+    #[cfg(debug_assertions)]
+    {
+        let (width, height) = _img.dimensions();
+        let total_pixels = (width * height) as f32;
 
-    // Calculate multiple complexity metrics
-    let mut unique_colors = std::collections::HashSet::new();
-    let mut edge_count = 0;
+        // Calculate multiple complexity metrics
+        let mut unique_colors = std::collections::HashSet::new();
+        let mut edge_count = 0;
 
-    for pixel in img.pixels() {
-        unique_colors.insert((pixel[0], pixel[1], pixel[2]));
-    }
+        for pixel in _img.pixels() {
+            unique_colors.insert((pixel[0], pixel[1], pixel[2]));
+        }
 
-    // Count edge pixels using simple gradient
-    for y in 1..height - 1 {
-        for x in 1..width - 1 {
-            let center = img.get_pixel(x, y);
-            let right = img.get_pixel(x + 1, y);
-            let bottom = img.get_pixel(x, y + 1);
+        // Count edge pixels using simple gradient
+        for y in 1..height - 1 {
+            for x in 1..width - 1 {
+                let center = _img.get_pixel(x, y);
+                let right = _img.get_pixel(x + 1, y);
+                let bottom = _img.get_pixel(x, y + 1);
 
-            let center_brightness =
-                0.299 * center[0] as f32 + 0.587 * center[1] as f32 + 0.114 * center[2] as f32;
-            let right_brightness =
-                0.299 * right[0] as f32 + 0.587 * right[1] as f32 + 0.114 * right[2] as f32;
-            let bottom_brightness =
-                0.299 * bottom[0] as f32 + 0.587 * bottom[1] as f32 + 0.114 * bottom[2] as f32;
+                let center_brightness =
+                    0.299 * center[0] as f32 + 0.587 * center[1] as f32 + 0.114 * center[2] as f32;
+                let right_brightness =
+                    0.299 * right[0] as f32 + 0.587 * right[1] as f32 + 0.114 * right[2] as f32;
+                let bottom_brightness =
+                    0.299 * bottom[0] as f32 + 0.587 * bottom[1] as f32 + 0.114 * bottom[2] as f32;
 
-            if (center_brightness - right_brightness).abs() > 20.0
-                || (center_brightness - bottom_brightness).abs() > 20.0
-            {
-                edge_count += 1;
+                if (center_brightness - right_brightness).abs() > 20.0
+                    || (center_brightness - bottom_brightness).abs() > 20.0
+                {
+                    edge_count += 1;
+                }
             }
         }
+
+        // Better normalization for complexity metrics
+        let color_ratio = unique_colors.len() as f32 / total_pixels;
+        let edge_ratio = edge_count as f32 / total_pixels;
+
+        // Logarithmic scaling for color complexity (since high color count is exponentially complex)
+        let color_complexity = if color_ratio > 0.001 {
+            (color_ratio * 1000.0).ln() / 6.9 // ln(1000) ≈ 6.9, so this scales 0.001-1.0 to 0.0-1.0
+        } else {
+            0.0
+        }
+        .min(1.0);
+
+        let edge_complexity = (edge_ratio * 10.0).min(1.0); // Scale edge ratio
+
+        // Combine metrics with emphasis on color complexity for detailed images
+        let complexity = color_complexity * 0.8 + edge_complexity * 0.2;
+
+        println!("Image complexity score: {:.2}", complexity);
     }
 
-    // Better normalization for complexity metrics
-    let color_ratio = unique_colors.len() as f32 / total_pixels;
-    let edge_ratio = edge_count as f32 / total_pixels;
-
-    // Logarithmic scaling for color complexity (since high color count is exponentially complex)
-    let color_complexity = if color_ratio > 0.001 {
-        (color_ratio * 1000.0).ln() / 6.9 // ln(1000) ≈ 6.9, so this scales 0.001-1.0 to 0.0-1.0
-    } else {
-        0.0
-    }
-    .min(1.0);
-
-    let edge_complexity = (edge_ratio * 10.0).min(1.0); // Scale edge ratio
-
-    // Combine metrics with emphasis on color complexity for detailed images
-    let complexity = color_complexity * 0.8 + edge_complexity * 0.2;
-    complexity
+    Ok(())
 }

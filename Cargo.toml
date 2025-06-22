@@ -13,3 +13,4 @@ terminal_size = "0.3"
 lto = true
 strip = true
 opt-level = 3
+codegen-units = 1
