@@ -62,7 +62,7 @@ pub struct Args {
     #[arg(long, default_value = "1.6")]
     pub sigma2: f32,
 
-    #[arg(long, default_value = "1.0")]
+    #[arg(long, default_value = "1.2")]
     pub gamma: f32,
 }
 
@@ -193,9 +193,24 @@ fn select_character_with_edge(
         // For strong edges, use directional characters
         get_edge_character(edge_info.direction)
     } else {
-        // For regular areas, use simple density-based selection
+        // For regular areas, use improved density-based selection
+        let normalized_brightness = 1.0 - brightness / 255.0; // 0.0 = bright, 1.0 = dark
+
+        // Apply threshold to prevent overuse of smallest characters
+        // Only use the lightest characters (first 20% of charset) for very bright areas
+        let adjusted_brightness = if normalized_brightness < 0.2 {
+            // For very bright areas, compress to use only lightest 15% of characters
+            normalized_brightness * 0.75
+        } else if normalized_brightness < 0.4 {
+            // For bright areas, slightly compress the range
+            0.15 + (normalized_brightness - 0.2) * 0.8
+        } else {
+            // For medium to dark areas, use full range starting from 35% of charset
+            0.35 + (normalized_brightness - 0.4) * 1.08
+        };
+
         let char_index =
-            ((1.0 - brightness / 255.0) * (char_infos.len() - 1) as f32).round() as usize;
+            (adjusted_brightness.clamp(0.0, 1.0) * (char_infos.len() - 1) as f32).round() as usize;
         char_infos[char_index.min(char_infos.len() - 1)].character
     }
 }
@@ -362,7 +377,23 @@ fn apply_auto_contrast(img: RgbImage) -> RgbImage {
     }
 
     let total_pixels = (width * height) as f32;
-    let clip_percent = 0.01; // 1% clipping on each side
+
+    // Calculate average brightness to adapt processing
+    let mut brightness_sum = 0.0;
+    for (i, &count) in histogram.iter().enumerate() {
+        brightness_sum += i as f32 * count as f32;
+    }
+    let avg_brightness = brightness_sum / total_pixels;
+
+    // Adaptive clipping based on brightness
+    let clip_percent = if avg_brightness > 180.0 {
+        0.03 // More aggressive for very bright images
+    } else if avg_brightness > 140.0 {
+        0.02 // Medium for bright images
+    } else {
+        0.01 // Conservative for normal/dark images
+    };
+
     let clip_threshold = (total_pixels * clip_percent) as u32;
 
     // Find clipping points
@@ -400,10 +431,26 @@ fn apply_auto_contrast(img: RgbImage) -> RgbImage {
 
     let mut output = RgbImage::new(width, height);
 
-    // Apply linear transformation: new_pixel = pixel * alpha + beta
+    // Apply enhanced transformation for better visibility
     for (x, y, pixel) in img.enumerate_pixels() {
         let old_value = pixel[0] as f32;
-        let new_value = (old_value * alpha + beta).clamp(0.0, 255.0) as u8;
+        let linear_value = (old_value * alpha + beta).clamp(0.0, 255.0);
+
+        // Apply slight S-curve for better contrast in auto-contrast
+        let normalized = linear_value / 255.0;
+        let enhanced = if avg_brightness > 160.0 {
+            // For bright images, apply stronger contrast enhancement
+            if normalized < 0.5 {
+                (2.0 * normalized).powf(1.3) / 2.0
+            } else {
+                1.0 - (2.0 * (1.0 - normalized)).powf(1.3) / 2.0
+            }
+        } else {
+            // For normal images, use milder enhancement
+            normalized * normalized * (3.0 - 2.0 * normalized)
+        };
+
+        let new_value = (enhanced * 255.0).clamp(0.0, 255.0) as u8;
         output.put_pixel(x, y, Rgb([new_value, new_value, new_value]));
     }
 
@@ -844,8 +891,23 @@ fn apply_enhanced_contrast(img: RgbImage) -> RgbImage {
     }
 
     let total_pixels = (width * height) as f32;
-    // More aggressive clipping for no-dither mode
-    let clip_percent = 0.02; // 2% clipping on each side
+
+    // Calculate average brightness to detect bright images
+    let mut brightness_sum = 0.0;
+    for (i, &count) in histogram.iter().enumerate() {
+        brightness_sum += i as f32 * count as f32;
+    }
+    let avg_brightness = brightness_sum / total_pixels;
+
+    // Adaptive clipping based on image brightness
+    let clip_percent = if avg_brightness > 180.0 {
+        0.05 // More aggressive clipping for bright images
+    } else if avg_brightness > 120.0 {
+        0.03 // Medium clipping for medium brightness
+    } else {
+        0.02 // Standard clipping for dark images
+    };
+
     let clip_threshold = (total_pixels * clip_percent) as u32;
 
     // Find clipping points
@@ -883,16 +945,23 @@ fn apply_enhanced_contrast(img: RgbImage) -> RgbImage {
 
     let mut output = RgbImage::new(width, height);
 
-    // Apply linear transformation with S-curve for better contrast
+    // Apply enhanced transformation for better contrast
     for (x, y, pixel) in img.enumerate_pixels() {
         let old_value = pixel[0] as f32;
         let linear_value = (old_value * alpha + beta).clamp(0.0, 255.0);
 
-        // Apply S-curve for better contrast
+        // Apply enhanced S-curve for better contrast, especially for bright images
         let normalized = linear_value / 255.0;
-        let s_curve = normalized * normalized * (3.0 - 2.0 * normalized); // Smoothstep
-        let final_value = (s_curve * 255.0) as u8;
+        let contrast_factor = if avg_brightness > 160.0 { 1.8 } else { 1.4 };
 
+        // Enhanced S-curve with adjustable contrast
+        let enhanced_curve = if normalized < 0.5 {
+            (2.0 * normalized).powf(contrast_factor) / 2.0
+        } else {
+            1.0 - (2.0 * (1.0 - normalized)).powf(contrast_factor) / 2.0
+        };
+
+        let final_value = (enhanced_curve * 255.0).clamp(0.0, 255.0) as u8;
         output.put_pixel(x, y, Rgb([final_value, final_value, final_value]));
     }
 
