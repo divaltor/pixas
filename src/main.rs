@@ -72,6 +72,9 @@ pub struct Args {
 
     #[arg(long)]
     pub invert_luminance: bool,
+
+    #[arg(long, default_value = "false")]
+    pub debug: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -154,17 +157,19 @@ fn process_image(
     };
 
     // Print exposure analysis for debugging
-    println!("Content-aware exposure analysis:");
-    println!("  Calculated exposure: {:.2}", calculated_exposure);
-    println!("  Calculated attenuation: {:.2}", calculated_attenuation);
-    println!("  Calculated invert: {}", calculated_invert);
-    println!("  Using exposure: {:.2}", final_exposure);
-    println!("  Using attenuation: {:.2}", final_attenuation);
-    println!("  Using invert: {}", final_invert);
+    if args.debug {
+        println!("Content-aware exposure analysis:");
+        println!("  Calculated exposure: {:.2}", calculated_exposure);
+        println!("  Calculated attenuation: {:.2}", calculated_attenuation);
+        println!("  Calculated invert: {}", calculated_invert);
+        println!("  Using exposure: {:.2}", final_exposure);
+        println!("  Using attenuation: {:.2}", final_attenuation);
+        println!("  Using invert: {}", final_invert);
+
+        analyze_image_characteristics(&img);
+    }
 
     let processed_img = if args.no_dither {
-        analyze_image_characteristics(&img);
-
         let grayscale = apply_grayscale_and_tone_mapping(img);
         let enhanced = apply_enhanced_contrast(grayscale);
         let gamma_corrected = apply_gamma_correction(enhanced, args.gamma);
@@ -1132,69 +1137,66 @@ fn apply_unsharp_mask(img: RgbImage) -> RgbImage {
 }
 
 fn analyze_image_characteristics(_img: &RgbImage) {
-    #[cfg(debug_assertions)]
-    {
-        let (width, height) = _img.dimensions();
-        let total_pixels = (width * height) as f32;
+    let (width, height) = _img.dimensions();
+    let total_pixels = (width * height) as f32;
 
-        // Analyze brightness distribution
-        let mut brightness_sum = 0.0;
-        let mut brightness_histogram = [0u32; 256];
-        let mut unique_colors = std::collections::HashSet::new();
+    // Analyze brightness distribution
+    let mut brightness_sum = 0.0;
+    let mut brightness_histogram = [0u32; 256];
+    let mut unique_colors = std::collections::HashSet::new();
 
-        for pixel in _img.pixels() {
-            let r = pixel[0] as f32;
-            let g = pixel[1] as f32;
-            let b = pixel[2] as f32;
+    for pixel in _img.pixels() {
+        let r = pixel[0] as f32;
+        let g = pixel[1] as f32;
+        let b = pixel[2] as f32;
 
-            let brightness = (0.299 * r + 0.587 * g + 0.114 * b) as u8;
-            brightness_sum += brightness as f32;
-            brightness_histogram[brightness as usize] += 1;
+        let brightness = (0.299 * r + 0.587 * g + 0.114 * b) as u8;
+        brightness_sum += brightness as f32;
+        brightness_histogram[brightness as usize] += 1;
 
-            unique_colors.insert((pixel[0], pixel[1], pixel[2]));
-        }
-
-        let avg_brightness = brightness_sum / total_pixels;
-
-        // Calculate contrast (standard deviation of brightness)
-        let mut variance_sum = 0.0;
-        for pixel in _img.pixels() {
-            let r = pixel[0] as f32;
-            let g = pixel[1] as f32;
-            let b = pixel[2] as f32;
-            let brightness = 0.299 * r + 0.587 * g + 0.114 * b;
-            let diff = brightness - avg_brightness;
-            variance_sum += diff * diff;
-        }
-        let contrast = (variance_sum / total_pixels).sqrt();
-
-        // Find brightness range
-        let mut min_brightness = 255u8;
-        let mut max_brightness = 0u8;
-        for (i, &count) in brightness_histogram.iter().enumerate() {
-            if count > 0 {
-                min_brightness = min_brightness.min(i as u8);
-                max_brightness = max_brightness.max(i as u8);
-            }
-        }
-
-        println!("=== Image Analysis ===");
-        println!("Average brightness: {:.1}", avg_brightness);
-        println!("Contrast (std dev): {:.1}", contrast);
-        println!("Brightness range: {} - {}", min_brightness, max_brightness);
-        println!("Unique colors: {}", unique_colors.len());
-
-        // Determine if image is likely to have issues with no-dither
-        if contrast < 30.0 {
-            println!("⚠️  LOW CONTRAST detected - may have issues with --no-dither");
-        }
-        if max_brightness - min_brightness < 100 {
-            println!("⚠️  NARROW BRIGHTNESS RANGE detected - may have issues with --no-dither");
-        }
-        if unique_colors.len() < 50 {
-            println!("⚠️  LIMITED COLOR PALETTE detected - may benefit from dithering");
-        }
-
-        println!("========================");
+        unique_colors.insert((pixel[0], pixel[1], pixel[2]));
     }
+
+    let avg_brightness = brightness_sum / total_pixels;
+
+    // Calculate contrast (standard deviation of brightness)
+    let mut variance_sum = 0.0;
+    for pixel in _img.pixels() {
+        let r = pixel[0] as f32;
+        let g = pixel[1] as f32;
+        let b = pixel[2] as f32;
+        let brightness = 0.299 * r + 0.587 * g + 0.114 * b;
+        let diff = brightness - avg_brightness;
+        variance_sum += diff * diff;
+    }
+    let contrast = (variance_sum / total_pixels).sqrt();
+
+    // Find brightness range
+    let mut min_brightness = 255u8;
+    let mut max_brightness = 0u8;
+    for (i, &count) in brightness_histogram.iter().enumerate() {
+        if count > 0 {
+            min_brightness = min_brightness.min(i as u8);
+            max_brightness = max_brightness.max(i as u8);
+        }
+    }
+
+    println!("=== Image Analysis ===");
+    println!("Average brightness: {:.1}", avg_brightness);
+    println!("Contrast (std dev): {:.1}", contrast);
+    println!("Brightness range: {} - {}", min_brightness, max_brightness);
+    println!("Unique colors: {}", unique_colors.len());
+
+    // Determine if image is likely to have issues with no-dither
+    if contrast < 30.0 {
+        println!("⚠️  LOW CONTRAST detected - may have issues with --no-dither");
+    }
+    if max_brightness - min_brightness < 100 {
+        println!("⚠️  NARROW BRIGHTNESS RANGE detected - may have issues with --no-dither");
+    }
+    if unique_colors.len() < 50 {
+        println!("⚠️  LIMITED COLOR PALETTE detected - may benefit from dithering");
+    }
+
+    println!("========================");
 }
